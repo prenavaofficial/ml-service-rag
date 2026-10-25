@@ -1,0 +1,29 @@
+# Virtual Environment
+venv/
+env/
+.venv/
+ENV/
+
+# Environment Variables & Secrets
+.env
+.env*.local
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Local Vector Database (dapat dibuat ulang dengan menjalankan setup_db.py)
+chroma_db/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS generated files
+.DS_Store
+Thumbs.db
