@@ -1,15 +1,25 @@
-fastapi
-uvicorn
-pydantic
-python-dotenv
-python-multipart
-groq
-langchain
-langchain-core
-langchain-community
-langchain-groq
-langchain-text-splitters
-chromadb
-sentence-transformers
-pypdf
-fonttools
+# Web Framework & Server
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+pydantic>=2.6.0
+python-multipart>=0.0.9
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Dual-LLM Providers & Speech-to-Text
+groq>=0.11.0
+google-generativeai>=0.8.0
+
+# LangChain Ecosystem & Document Processing
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langchain-groq>=0.1.0
+langchain-text-splitters>=0.2.0
+pypdf>=4.2.0
+fonttools>=4.49.0
+
+# Vector Database & Semantic Embeddings
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+torch>=2.2.0

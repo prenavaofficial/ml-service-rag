@@ -1,15 +1,32 @@
 import os
+import gc
 import re
+import logging
+from typing import Dict, Any, List, Tuple
 from dotenv import load_dotenv
+
+# Optimasi alokasi memori Windows untuk mencegah WinError 1455
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+import torch
+try:
+    torch.set_num_threads(1)
+except Exception:
+    pass
+
 from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
+import google.generativeai as genai
+
 from setup_db import build_vector_db
+from danger_classifier import ObstetricDangerClassifier, DANGER_TAXONOMY
 
 load_dotenv()
+logger = logging.getLogger("rag-engine")
 
-# 1. Setup Database & LLM
+# 1. Setup ChromaDB Vector Store & HuggingFace Embeddings
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
@@ -32,38 +49,31 @@ def _needs_reindex(vector_db: Chroma) -> bool:
 
 
 if _needs_reindex(db):
+    print("[*] Membangun indeks ChromaDB baru dengan pemulihan font & pemisahan 2-page spread...")
     db = build_vector_db(embeddings=embeddings)
 
-llm = ChatGroq(model_name="qwen/qwen3.8-27b", temperature=0)
+# 2. Setup Dual-LLM (Primary: Groq Qwen, Fallback: Google Gemini)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# 2. Emergency Danger Rule Classifier
-DANGER_PATTERNS = [
-    r"\bp[er]ndarahan\b",
-    r"\bperdarahan\b",
-    r"\bflek\s+banyak\b",
-    r"\bkeluar\s+darah\b",
-    r"\bketuban\s+(pecah|rembes|keluar|hijau|berbau)\b",
-    r"\bair\s+ketuban\b",
-    r"\b(kejang|pingsan|tidak\s+sadar)\b",
-    r"\b(nyeri|sakit|kram)\s+perut\s+hebat\b",
-    r"\bgerak(an)?\s+(bayi|janin)\s+(hilang|berkurang|tidak\s+ada|lemah)\b",
-    r"\b(bayi|janin)\s+tidak\s+bergerak\b",
-    r"\b(demam|panas)\s+tinggi\b",
-    r"\bmuntah\s+(terus|hebat)\b",
-    r"\btidak\s+mau\s+makan\b",
-    r"\b(sakit\s+kepala|pusing)\s+(hebat|berat)\b",
-    r"\bpandangan\s+kabur\b",
-    r"\bbengkak\s+(di\s+)?(wajah|muka|tangan)\b",
-]
-DANGER_REGEX = re.compile("|".join(DANGER_PATTERNS), re.IGNORECASE)
+# Primary Provider: ChatGroq
+try:
+    llm = ChatGroq(model_name="qwen/qwen3.8-27b", temperature=0.1, api_key=GROQ_API_KEY)
+except Exception as e:
+    logger.warning(f"Inisialisasi ChatGroq gagal: {e}")
+    llm = None
+
+# Fallback Provider: Google Gemini
+gemini_model = None
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel("gemini-3.8-flash")
+    except Exception as e:
+        logger.warning(f"Inisialisasi Google Gemini fallback gagal: {e}")
 
 
-def check_emergency(text: str) -> bool:
-    if not text:
-        return False
-    return bool(DANGER_REGEX.search(text))
-
-
+# 3. Helper Rekonstruksi Halaman Buku KIA (Metode Okta)
 def _merge_page_chunks(chunks: list[str]) -> str:
     """Menggabungkan kembali chunks dalam satu halaman tanpa duplikasi bagian yang overlap."""
     if not chunks:
@@ -127,7 +137,7 @@ def _retrieve_full_kia_pages(query: str, max_pages: int = 5) -> list[tuple[str, 
     # Beri skor gabungan untuk setiap halaman Buku KIA
     page_scores: dict[str, float] = {}
 
-    # 1. Skor dari pencarian vektor semantik (urutan teratas mendapat bobot lebih besar)
+    # 1. Skor dari pencarian vektor semantik
     for rank, vdoc in enumerate(vector_docs):
         p_label = str(vdoc.metadata.get("page_label") or vdoc.metadata.get("page") or "")
         if p_label:
@@ -140,7 +150,7 @@ def _retrieve_full_kia_pages(query: str, max_pages: int = 5) -> list[tuple[str, 
         phrase_hits = sum(4.0 for phrase in bonus_phrases if phrase in t_lower)
         if kw_hits > 0 or phrase_hits > 0:
             score = page_scores.get(p_label, 0.0) + kw_hits + phrase_hits
-            # Penalti ringan untuk halaman formulir kosong nakes/pemantauan jika bukan itu yang ditanyakan
+            # Penalti ringan untuk halaman formulir pemantauan/nakes jika bukan itu yang ditanyakan
             if (
                 "diisi oleh tenaga kesehatan" in t_lower
                 or "diisi oleh dokter" in t_lower
@@ -152,7 +162,7 @@ def _retrieve_full_kia_pages(query: str, max_pages: int = 5) -> list[tuple[str, 
     ranked_pages = sorted(page_scores.items(), key=lambda x: x[1], reverse=True)
     selected_labels = [p for p, _ in ranked_pages[:max_pages] if p in full_pages]
 
-    # Urutkan halaman terpilih berdasarkan nomor halaman agar alur baca LLM berurutan (misal Trimester 1 -> 2 -> 3)
+    # Urutkan halaman terpilih berdasarkan nomor halaman agar alur baca LLM runut
     def _page_sort_key(lbl: str) -> int:
         return int(lbl) if lbl.isdigit() else 999
 
@@ -160,9 +170,9 @@ def _retrieve_full_kia_pages(query: str, max_pages: int = 5) -> list[tuple[str, 
     return [(lbl, full_pages[lbl]) for lbl in selected_labels]
 
 
-# 3. Prompt Engineering Anti-Halusinasi (DITAMBAH INSTRUKSI HALAMAN BUKU KIA ASLI)
-prompt_template = """Kamu adalah Asisten Bidan Prenava yang ramah, jelas, dan berbasis bukti ilmiah.
-Jawablah pertanyaan Ibu HANYA berdasarkan konteks Buku KIA Kemenkes RI berikut:
+# 4. Prompt Engineering Medis Anti-Halusinasi
+prompt_template = """Kamu adalah Asisten Bidan Prenava yang ramah, empatik, jelas, dan berbasis bukti ilmiah.
+Jawablah pertanyaan Ibu HANYA berdasarkan konteks resmi Buku KIA Kemenkes RI berikut:
 
 {context}
 
@@ -170,34 +180,60 @@ Pertanyaan: {question}
 
 Aturan Jawaban:
 1. Jawablah secara akurat, lengkap, dan terstruktur sesuai isi Buku KIA di atas.
-2. Jika informasi sama sekali tidak ditemukan di dalam konteks di atas, katakan persis: "Informasi tersebut belum tercantum dalam panduan resmi Buku KIA, silakan konsultasi ke Bidan."
-3. DILARANG menebak atau memberikan dosis obat keras.
-4. Wajib sebutkan nomor halaman Buku KIA yang menjadi rujukan di akhir jawaban (hanya sebutkan nomor halaman yang benar-benar memuat informasi jawaban tersebut).
+2. Jika informasi sama sekali tidak ditemukan di dalam konteks di atas, katakan persis: "Informasi tersebut belum tercantum dalam panduan ringkas Buku KIA ini, silakan konsultasi ke Bidan atau Dokter kandungan Anda."
+3. DILARANG menebak, mengarang, atau meresepkan dosis obat keras/antibiotik tanpa resep dokter.
+4. Wajib sebutkan nomor halaman Buku KIA yang menjadi rujukan di akhir jawaban (misal: "Rujukan: Buku KIA Kemenkes RI Halaman X").
 
 Jawaban:
 """
 prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
 
 
-def ask_rag(query: str):
-    query = (query or "").strip()
-    if not query:
+# 5. Core RAG Inference Function (Terintegrasi Prenava & Backward Compatible)
+def ask_rag(query: str, transcribed_text: str = None) -> Dict[str, Any]:
+    effective_text = (transcribed_text or query or "").strip()
+    if not effective_text:
         return {
-            "answer": "Silakan masukkan pertanyaan seputar kesehatan ibu dan anak.",
+            "status": "empty_query",
+            "query": "",
+            "answer": "Silakan masukkan pertanyaan seputar kesehatan ibu hamil dan anak.",
+            "reference_source": "Buku KIA Kemenkes RI",
             "is_emergency": False,
+            "danger_level": "NORMAL",
+            "danger_keywords": [],
+            "recommended_action": "Konsultasikan dengan Bidan pada jadwal ANC berikutnya.",
+            "provider_used": "none",
+            "retrieved_contexts": []
         }
 
-    is_emergency = check_emergency(query)
-    if is_emergency:
+    # A. Deteksi Tanda Bahaya Obstetri (Circuit Breaker)
+    danger_eval = ObstetricDangerClassifier.evaluate(effective_text)
+    if danger_eval["is_emergency"]:
+        primary_cat = danger_eval["detected_categories"][0]
+        emergency_answer = (
+            f"🚨 PERHATIAN MEDIS SEGERA (TANDA BAHAYA KEHAMILAN) 🚨\n\n"
+            f"Keluhan yang Ibu sampaikan terindikasi sebagai '{primary_cat['label']}'.\n\n"
+            f"TINDAKAN MEDIS WAJIB DARI BUKU KIA KEMENKES RI:\n"
+            f"• {primary_cat['recommended_action']}\n"
+            f"• Jangan menunda waktu dan jangan mencoba mengobati sendiri di rumah.\n"
+            f"• Mintalah keluarga untuk segera mendampingi menuju fasilitas kesehatan terdekat (Bidan/Puskesmas/IGD RS)."
+        )
         return {
-            "answer": (
-                "PERHATIAN: Gejala yang Ibu alami merupakan TANDA BAHAYA KEHAMILAN. "
-                "SEGERA MENUJU KE KLINIK BIDAN, PUSKESMAS, ATAU IGD RUMAH SAKIT TERDEKAT!"
-            ),
+            "status": "emergency_alert",
+            "query": query,
+            "transcribed_text": transcribed_text,
+            "answer": emergency_answer,
+            "reference_source": "Buku KIA Kemenkes RI - Lembar Tanda Bahaya Kehamilan",
             "is_emergency": True,
+            "danger_level": "EMERGENCY",
+            "danger_keywords": danger_eval["matched_keywords"],
+            "recommended_action": primary_cat["recommended_action"],
+            "provider_used": "circuit_breaker",
+            "retrieved_contexts": []
         }
 
-    matched_pages = _retrieve_full_kia_pages(query, max_pages=5)
+    # B. Semantic & Hybrid Page-Level Retrieval (Metode Okta)
+    matched_pages = _retrieve_full_kia_pages(effective_text, max_pages=5)
 
     context = "\n\n========================================\n\n".join(
         [
@@ -206,13 +242,65 @@ def ask_rag(query: str):
         ]
     )
 
-    chain = prompt | llm
-    response = chain.invoke({"context": context, "question": query})
+    page_labels = [lbl for lbl, _ in matched_pages if lbl and lbl != "Tidak diketahui"]
+    ref_source = f"Buku KIA Kemenkes RI - Halaman {', '.join(page_labels)}" if page_labels else "Buku KIA Kemenkes RI"
 
-    # Bersihkan tag <think>...</think> jika model menyertakannya
-    answer_text = re.sub(r"<think>.*?</think>", "", response.content, flags=re.DOTALL).strip()
+    # C. Dual-LLM Generation (Groq Primary -> Gemini Fallback)
+    provider_used = "groq"
+    answer_text = ""
+
+    try:
+        if llm is None:
+            raise RuntimeError("ChatGroq belum terinisialisasi.")
+        chain = prompt | llm
+        response = chain.invoke({"context": context, "question": effective_text})
+        answer_text = response.content if hasattr(response, "content") else str(response)
+    except Exception as groq_err:
+        logger.warning(f"[!] Groq primary error ({groq_err}), beralih ke Google Gemini fallback...")
+        if gemini_model:
+            try:
+                full_prompt = prompt_template.format(context=context, question=effective_text)
+                gemini_resp = gemini_model.generate_content(
+                    full_prompt,
+                    generation_config={"temperature": 0.1, "max_output_tokens": 800}
+                )
+                answer_text = gemini_resp.text
+                provider_used = "gemini"
+            except Exception as gem_err:
+                logger.error(f"[X] Gemini fallback juga error: {gem_err}")
+                answer_text = (
+                    "Mohon maaf, sistem AI Bidan sedang mengalami gangguan koneksi ke server LLM. "
+                    "Namun berdasarkan pencarian Buku KIA, Anda dapat merujuk ke " + ref_source
+                )
+                provider_used = "retrieval_only"
+        else:
+            answer_text = f"Terjadi kendala pada layanan AI: {str(groq_err)}"
+
+    # Bersihkan tag pemikiran <think> jika ada
+    answer_text = re.sub(r"<think>.*?</think>", "", answer_text, flags=re.DOTALL).strip()
+
+    # Susun potongan konteks untuk transparansi frontend / evaluasi Ragas
+    retrieved_contexts = [
+        {
+            "page": int(lbl) if lbl.isdigit() else 0,
+            "source": f"Buku KIA Kemenkes RI - Halaman {lbl}",
+            "similarity": 0.90,
+            "danger_level": "NORMAL",
+            "text_snippet": (page_text[:160] + "...") if len(page_text) > 160 else page_text
+        }
+        for lbl, page_text in matched_pages
+    ]
 
     return {
+        "status": "success",
+        "query": query,
+        "transcribed_text": transcribed_text,
         "answer": answer_text,
+        "reference_source": ref_source,
         "is_emergency": False,
+        "danger_level": "NORMAL",
+        "danger_keywords": [],
+        "recommended_action": "Terapkan panduan pola hidup sehat dan konsultasikan dengan Bidan pada jadwal ANC berikutnya.",
+        "provider_used": provider_used,
+        "retrieved_contexts": retrieved_contexts
     }

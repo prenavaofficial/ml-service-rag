@@ -18,6 +18,9 @@ __pycache__/
 # Local Vector Database (dapat dibuat ulang dengan menjalankan setup_db.py)
 chroma_db/
 
+# Evaluation Reports
+academic_evaluation_report.json
+
 # IDE & Editor files
 .vscode/
 .idea/

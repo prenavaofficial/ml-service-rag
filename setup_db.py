@@ -1,3 +1,12 @@
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+import torch
+try:
+    torch.set_num_threads(1)
+except Exception:
+    pass
+
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from ingest_docs import load_and_chunk_pdf
